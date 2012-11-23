@@ -24,7 +24,9 @@
 #ifdef WIN32
 
 #else
-#include <ifaddrs.h>
+//#include <ifaddrs.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -122,13 +124,51 @@ libwebsockets_decode_ssl_error(void)
 }
 #endif
 
-
+// From minissdp - replace ifaddrs interface because it's not available on Android.
+/**
+ * Get the IPv4 address from a string
+ * representing the address or the interface name
+ */
+//in_addr_t
+//GetIfAddrIPv4(const char * ifaddr)
 static int
+interface_to_sa(const char* ifname, struct sockaddr_in *return_addr, size_t addrlen)
+{
+	int s;
+	struct ifreq ifr;
+	int ifrlen;
+	
+    // this is just for the interface name....
+	s = socket(PF_INET, SOCK_DGRAM, 0);
+	if(s < 0)
+	{
+		fprintf(stderr, "socket(PF_INET, SOCK_DGRAM): %m");
+		return 1;
+	}
+	memset(&ifr, 0, sizeof(struct ifreq));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+	if(ioctl(s, SIOCGIFADDR, &ifr, &ifrlen) < 0)
+	{
+		fprintf(stderr, "ioctl(s, SIOCGIFADDR, ...): %m");
+		close(s);
+		return 1;
+	}
+	fprintf(stderr, "GetIfAddrIPv4(%s) = %s", ifname,
+	       inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
+    //	addr = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
+	close(s);
+    
+    memcpy(return_addr, &ifr.ifr_addr, addrlen);
+	return 0;
+}
+
+
+/*static int
 interface_to_sa(const char *ifname, struct sockaddr_in *addr, size_t addrlen)
 {
 	int rc = -1;
 #ifdef WIN32
-	/* TODO */
+ // TODO 
 #else
 	struct ifaddrs *ifr;
 	struct ifaddrs *ifc;
@@ -150,7 +190,7 @@ interface_to_sa(const char *ifname, struct sockaddr_in *addr, size_t addrlen)
 	freeifaddrs(ifr);
 #endif
 	return rc;
-}
+}*/
 
 void
 libwebsocket_close_and_free_session(struct libwebsocket_context *context,

@@ -23,7 +23,7 @@
 #ifdef CMAKE_BUILD
 #include "lws_config.h"
 #else
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
 #define inline __inline
 #else
 #include "config.h"
@@ -55,10 +55,19 @@
 
 #include <sys/stat.h>
 
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
 #define LWS_NO_DAEMONIZE
 #ifndef EWOULDBLOCK
 #define EWOULDBLOCK EAGAIN
+#endif
+#ifndef EALREADY
+#define EALREADY WSAEALREADY
+#endif
+#ifndef EINPROGRESS
+#define EINPROGRESS WSAEINPROGRESS
+#endif
+#ifndef EISCONN
+#define EISCONN WSAEISCONN
 #endif
 
 #define compatible_close(fd) closesocket(fd);
@@ -173,6 +182,7 @@ enum lws_connection_states {
 	WSI_STATE_HTTP,
 	WSI_STATE_HTTP_ISSUING_FILE,
 	WSI_STATE_HTTP_HEADERS,
+	WSI_STATE_HTTP_BODY,
 	WSI_STATE_DEAD_SOCKET,
 	WSI_STATE_ESTABLISHED,
 	WSI_STATE_CLIENT_UNCONNECTED,
@@ -221,8 +231,10 @@ enum connection_mode {
 	LWS_CONNMODE_SSL_ACK_PENDING,
 
 	/* transient modes */
+	LWS_CONNMODE_WS_CLIENT_WAITING_CONNECT,
 	LWS_CONNMODE_WS_CLIENT_WAITING_PROXY_REPLY,
 	LWS_CONNMODE_WS_CLIENT_ISSUE_HANDSHAKE,
+	LWS_CONNMODE_WS_CLIENT_WAITING_SSL,
 	LWS_CONNMODE_WS_CLIENT_WAITING_SERVER_REPLY,
 	LWS_CONNMODE_WS_CLIENT_WAITING_EXTENSION_CONNECT,
 	LWS_CONNMODE_WS_CLIENT_PENDING_CANDIDATE_CHILD,
@@ -277,6 +289,7 @@ struct libwebsocket_context {
 
 #ifdef LWS_OPENSSL_SUPPORT
 	int use_ssl;
+	int allow_non_ssl_on_ssl_port;
 	SSL_CTX *ssl_ctx;
 	SSL_CTX *ssl_client_ctx;
 #endif
@@ -288,18 +301,25 @@ struct libwebsocket_context {
 	void *user_space;
 };
 
+enum uri_path_states {
+	URIPS_IDLE,
+	URIPS_SEEN_SLASH,
+	URIPS_SEEN_SLASH_DOT,
+	URIPS_SEEN_SLASH_DOT_DOT,
+	URIPS_ARGUMENTS,
+};
+
+enum uri_esc_states {
+	URIES_IDLE,
+	URIES_SEEN_PERCENT,
+	URIES_SEEN_PERCENT_H1,
+};
 
 /*
  * This is totally opaque to code using the library.  It's exported as a
  * forward-reference pointer-only declaration; the user can use the pointer with
  * other APIs to get information out of it.
  */
-
-struct _lws_http_mode_related {
-	int fd;
-	unsigned long filepos;
-	unsigned long filelen;
-};
 
 struct lws_fragments {
 	unsigned short offset;
@@ -319,10 +339,25 @@ struct allocated_headers {
 #endif
 };
 
+struct _lws_http_mode_related {
+	struct allocated_headers *ah; /* mirroring  _lws_header_related */
+	int fd;
+	unsigned long filepos;
+	unsigned long filelen;
+
+	int content_length;
+	int content_length_seen;
+	int body_index;
+	unsigned char *post_buffer;
+};
+
 struct _lws_header_related {
 	struct allocated_headers *ah;
 	short lextable_pos;
 	unsigned char parser_state; /* enum lws_token_indexes */
+	enum uri_path_states ups;
+	enum uri_esc_states ues;
+	char esc_stash;
 };
 
 struct _lws_websocket_related {
@@ -342,6 +377,8 @@ struct _lws_websocket_related {
 	int rxflow_pos;
 	unsigned int rxflow_change_to:2;
 	unsigned int this_frame_masked:1;
+	unsigned int inside_frame:1; /* next write will be more of frame */
+	unsigned int clean_buffer:1; /* buffer not rewritten by extension */
 };
 
 struct libwebsocket {
@@ -374,6 +411,11 @@ struct libwebsocket {
 	unsigned long action_start;
 	unsigned long latency_start;
 #endif
+
+	/* truncated send handling */
+	unsigned char *truncated_send_malloc; /* non-NULL means buffering in progress */
+	unsigned int truncated_send_offset; /* where we are in terms of spilling */
+	unsigned int truncated_send_len; /* how much is buffered */
 
 	void *user_space;
 
@@ -439,7 +481,7 @@ libwebsocket_service_timeout_check(struct libwebsocket_context *context,
 				    struct libwebsocket *wsi, unsigned int sec);
 
 LWS_EXTERN struct libwebsocket *
-__libwebsocket_client_connect_2(struct libwebsocket_context *context,
+libwebsocket_client_connect_2(struct libwebsocket_context *context,
 	struct libwebsocket *wsi);
 
 LWS_EXTERN struct libwebsocket *
@@ -500,6 +542,9 @@ lws_hdr_simple_create(struct libwebsocket *wsi,
 
 LWS_EXTERN int
 libwebsocket_ensure_user_space(struct libwebsocket *wsi);
+
+LWS_EXTERN void
+lws_change_pollfd(struct libwebsocket *wsi, int _and, int _or);
 
 #ifndef LWS_NO_SERVER
 LWS_EXTERN int handshake_0405(struct libwebsocket_context *context,

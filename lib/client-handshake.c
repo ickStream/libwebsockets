@@ -1,6 +1,6 @@
 #include "private-libwebsockets.h"
 
-struct libwebsocket *__libwebsocket_client_connect_2(
+struct libwebsocket *libwebsocket_client_connect_2(
 	struct libwebsocket_context *context,
 	struct libwebsocket *wsi
 ) {
@@ -11,7 +11,7 @@ struct libwebsocket *__libwebsocket_client_connect_2(
 	int plen = 0;
 	const char *ads;
 
-	lwsl_client("__libwebsocket_client_connect_2\n");
+       lwsl_client("libwebsocket_client_connect_2\n");
 
 	/*
 	 * proxy?
@@ -25,6 +25,80 @@ struct libwebsocket *__libwebsocket_client_connect_2(
 			"\x0d\x0a",
 			lws_hdr_simple_ptr(wsi, _WSI_TOKEN_CLIENT_PEER_ADDRESS),
 			wsi->u.hdr.ah->c_port);
+		ads = context->http_proxy_address;
+		server_addr.sin_port = htons(context->http_proxy_port);
+	} else {
+		ads = lws_hdr_simple_ptr(wsi, _WSI_TOKEN_CLIENT_PEER_ADDRESS);
+		server_addr.sin_port = htons(wsi->u.hdr.ah->c_port);
+	}
+
+	/*
+	 * prepare the actual connection (to the proxy, if any)
+	 */
+       lwsl_client("libwebsocket_client_connect_2: address %s\n", ads);
+
+	server_hostent = gethostbyname(ads);
+	if (server_hostent == NULL) {
+		lwsl_err("Unable to get host name from %s\n", ads);
+		goto oom4;
+	}
+
+	if (wsi->sock < 0) {
+
+		wsi->sock = socket(AF_INET, SOCK_STREAM, 0);
+
+		if (wsi->sock < 0) {
+			lwsl_warn("Unable to open socket\n");
+			goto oom4;
+		}
+
+		if (lws_set_socket_options(context, wsi->sock)) {
+			lwsl_err("Failed to set wsi socket options\n");
+			compatible_close(wsi->sock);
+			goto oom4;
+		}
+
+		wsi->mode = LWS_CONNMODE_WS_CLIENT_WAITING_CONNECT;
+
+		insert_wsi_socket_into_fds(context, wsi);
+
+		libwebsocket_set_timeout(wsi,
+			PENDING_TIMEOUT_AWAITING_CONNECT_RESPONSE,
+							      AWAITING_TIMEOUT);
+	}
+
+	server_addr.sin_family = AF_INET;
+	server_addr.sin_addr = *((struct in_addr *)server_hostent->h_addr);
+
+	bzero(&server_addr.sin_zero, 8);
+
+	if (connect(wsi->sock, (struct sockaddr *)&server_addr,
+			  sizeof(struct sockaddr)) == -1 || errno == EISCONN)  {
+
+		if (errno == EALREADY || errno == EINPROGRESS) {
+			lwsl_client("nonblocking connect retry\n");
+
+			/*
+			 * must do specifically a POLLOUT poll to hear
+			 * about the connect completion
+			 */
+			lws_change_pollfd(wsi, 0, POLLOUT);
+
+			return wsi;
+		}
+
+		if (errno != EISCONN) {
+		
+			lwsl_debug("Connect failed errno=%d\n", errno);
+			goto failed;
+		}
+	}
+
+	lwsl_client("connected\n");
+
+	/* we are connected to server, or proxy */
+
+	if (context->http_proxy_port) {
 
 		/* OK from now on we talk via the proxy, so connect to that */
 
@@ -34,62 +108,13 @@ struct libwebsocket *__libwebsocket_client_connect_2(
 		 */
 		if (lws_hdr_simple_create(wsi, _WSI_TOKEN_CLIENT_PEER_ADDRESS,
 						   context->http_proxy_address))
-			goto oom4;
+			goto failed;
 		wsi->u.hdr.ah->c_port = context->http_proxy_port;
-	}
-
-	/*
-	 * prepare the actual connection (to the proxy, if any)
-	 */
-
-	ads = lws_hdr_simple_ptr(wsi, _WSI_TOKEN_CLIENT_PEER_ADDRESS);
-
-	lwsl_client("__libwebsocket_client_connect_2: address %s\n", ads);
-
-	server_hostent = gethostbyname(ads);
-	if (server_hostent == NULL) {
-		lwsl_err("Unable to get host name from %s\n", ads);
-		goto oom4;
-	}
-
-	wsi->sock = socket(AF_INET, SOCK_STREAM, 0);
-
-	if (wsi->sock < 0) {
-		lwsl_warn("Unable to open socket\n");
-		goto oom4;
-	}
-
-	server_addr.sin_family = AF_INET;
-	server_addr.sin_port = htons(wsi->u.hdr.ah->c_port);
-	server_addr.sin_addr = *((struct in_addr *)server_hostent->h_addr);
-	bzero(&server_addr.sin_zero, 8);
-
-	if (connect(wsi->sock, (struct sockaddr *)&server_addr,
-					     sizeof(struct sockaddr)) == -1)  {
-		lwsl_debug("Connect failed\n");
-		compatible_close(wsi->sock);
-		goto oom4;
-	}
-
-	lwsl_client("connected\n");
-
-	if (lws_set_socket_options(context, wsi->sock)) {
-		lwsl_err("Failed to set wsi socket options\n");
-		compatible_close(wsi->sock);
-		goto oom4;
-	}
-
-	insert_wsi_socket_into_fds(context, wsi);
-
-	/* we are connected to server, or proxy */
-
-	if (context->http_proxy_port) {
 
 		n = send(wsi->sock, context->service_buffer, plen, MSG_NOSIGNAL);
 		if (n < 0) {
-			compatible_close(wsi->sock);
 			lwsl_debug("ERROR writing to proxy socket\n");
-			goto oom4;
+			goto failed;
 		}
 
 		libwebsocket_set_timeout(wsi,
@@ -121,7 +146,7 @@ struct libwebsocket *__libwebsocket_client_connect_2(
 	n = libwebsocket_service_fd(context, &pfd);
 
 	if (n < 0)
-		goto oom4;
+		goto failed;
 
 	if (n) /* returns 1 on failure after closing wsi */
 		return NULL;
@@ -131,7 +156,11 @@ struct libwebsocket *__libwebsocket_client_connect_2(
 oom4:
 	free(wsi->u.hdr.ah);
 	free(wsi);
+	return NULL;
 
+failed:
+	libwebsocket_close_and_free_session(context, wsi,
+						     LWS_CLOSE_STATUS_NOSTATUS);
 	return NULL;
 }
 
@@ -185,6 +214,7 @@ libwebsocket_client_connect(struct libwebsocket_context *context,
 		goto bail;
 
 	memset(wsi, 0, sizeof(*wsi));
+	wsi->sock = -1;
 
 	/* -1 means just use latest supported */
 
@@ -273,7 +303,7 @@ libwebsocket_client_connect(struct libwebsocket_context *context,
 #endif
 	lwsl_client("libwebsocket_client_connect: direct conn\n");
 
-	return __libwebsocket_client_connect_2(context, wsi);
+       return libwebsocket_client_connect_2(context, wsi);
 
 bail1:
 	free(wsi->u.hdr.ah);
